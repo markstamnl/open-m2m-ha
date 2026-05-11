@@ -71,10 +71,13 @@ def is_api_success_payload(payload: dict[str, Any]) -> bool:
     api_code = payload.get("APIcode")
     if api_code is not None:
         try:
-            if int(api_code) != 1000:
-                return False
+            code_int = int(api_code)
         except (TypeError, ValueError):
+            code_int = None
+        if code_int is not None and code_int != 1000:
             return False
+        # Unparsable ``APIcode`` (e.g. empty string): do not fail closed; use
+        # ``APIstatus`` / legacy markers below so valid payloads are not rejected.
 
     api_status = str(payload.get("APIstatus", "")).strip().lower()
     if api_status:

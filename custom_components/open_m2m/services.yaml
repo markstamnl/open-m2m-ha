@@ -1,0 +1,38 @@
+# Open-M2M integration services (OpenAPI v1.0.7)
+suspend_sim:
+  name: Suspend SIM
+  description: Suspends a SIM via the Open-M2M SuspendSIM endpoint (ICCID form field).
+  fields:
+    iccid:
+      name: ICCID
+      description: SIM ICCID to suspend.
+      required: true
+      example: "89000010000000000030000"
+      selector:
+        text:
+    config_entry_id:
+      name: Config entry
+      description: Required when more than one Open-M2M account is configured.
+      required: false
+      selector:
+        config_entry:
+          integration: open_m2m
+
+unsuspend_sim:
+  name: Unsuspend SIM
+  description: Unsuspends a SIM via the Open-M2M UnsuspendSIM endpoint (ICCID form field).
+  fields:
+    iccid:
+      name: ICCID
+      description: SIM ICCID to unsuspend.
+      required: true
+      example: "89000010000000000030000"
+      selector:
+        text:
+    config_entry_id:
+      name: Config entry
+      description: Required when more than one Open-M2M account is configured.
+      required: false
+      selector:
+        config_entry:
+          integration: open_m2m

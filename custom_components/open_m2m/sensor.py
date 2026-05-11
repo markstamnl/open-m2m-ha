@@ -25,6 +25,15 @@ from .coordinator import OpenM2MCoordinator, OpenM2MCoordinatorData
 _LOGGER = logging.getLogger(__name__)
 
 
+def _client_info_for_attrs(account: dict[str, Any]) -> dict[str, Any] | None:
+    """Match coordinator client-info key variants for balance debug attributes."""
+    for key in ("ClientInfo", "client_info", "clientInfo", "Clientinfo"):
+        ci = account.get(key)
+        if isinstance(ci, dict):
+            return ci
+    return None
+
+
 def _slug_suffix(value: str, *, max_len: int = 32) -> str:
     """Build a stable object-id suffix from ICCID or subscription id."""
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
@@ -204,9 +213,12 @@ class OpenM2MAccountBalanceSensor(OpenM2MBaseSensor):
             return {}
         account = data.get("account", {})
         attrs: dict[str, Any] = {}
-        ci = account.get("ClientInfo")
+        ci = _client_info_for_attrs(account)
         if isinstance(ci, dict):
             attrs["client_info"] = ci
+        braw = data.get("account_balance_raw")
+        if braw is not None:
+            attrs["account_balance_raw"] = braw
         if data.get("account_balance") is None:
             attrs["raw_account_keys"] = sorted(str(k) for k in account.keys())
         return attrs

@@ -4,7 +4,7 @@ This repository is the distribution home for the **Open-M2M** Home Assistant int
 
 The integration source lives at `custom_components/open_m2m/`.
 
-- **Branding** — `logo.png` / `icon.png` in that folder are picked up by Home Assistant next to `manifest.json`; the repo root may also keep `open-m2m-logo.png` as a source asset.
+- **Branding** — put `logo.png` and `icon.png` under `custom_components/open_m2m/brand/` (not next to `manifest.json`). Home Assistant **2026.3** and newer loads them via the built-in Brands proxy; older versions only show a logo if the domain exists on the [central brands CDN](https://github.com/home-assistant/brands). The repo root keeps `open-m2m-logo.png` as a source asset when updating those files.
 
 ## HACS
 

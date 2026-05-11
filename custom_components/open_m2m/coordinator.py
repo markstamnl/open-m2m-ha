@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, TypedDict
+import re
+from typing import Any, NotRequired, TypedDict
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -28,20 +29,88 @@ class OpenM2MCoordinatorData(TypedDict):
     sims: list[dict[str, Any]]
     subscriptions: list[dict[str, Any]]
     subscriptions_aggregate_remaining_bytes: int | None
+    account_balance_raw: NotRequired[Any]
 
 
-def _extract_balance(account: dict[str, Any]) -> float | None:
-    """Best-effort balance from ``GetAccountInfo`` (``ClientInfo.balance`` per OpenAPI)."""
-    client_info = account.get("ClientInfo")
-    if isinstance(client_info, dict):
-        bal = client_info.get("balance")
-        if isinstance(bal, (int, float)):
-            return float(bal)
-    for key in ("balance", "saldo", "Balance", "Saldo"):
-        val = account.get(key)
-        if isinstance(val, (int, float)):
-            return float(val)
+def _parse_balance_number(val: Any) -> float | None:
+    """Parse portal balance values: numbers, or strings with comma decimals / currency."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        s = val.strip()
+        s = re.sub(r"^[\s€$£]+|[\s€$£]+$", "", s, flags=re.IGNORECASE)
+        s = s.replace("EUR", "").strip()
+        if not s:
+            return None
+        # Both '.' and ',' — assume last separator is decimal (1.234,56 vs 1,234.56).
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        elif "," in s and "." not in s:
+            if s.count(",") == 1:
+                s = s.replace(",", ".")
+            else:
+                return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
     return None
+
+
+def _client_info_dict(account: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve client/account info block with alternate casings."""
+    for key in ("ClientInfo", "client_info", "clientInfo", "Clientinfo"):
+        ci = account.get(key)
+        if isinstance(ci, dict):
+            return ci
+    return None
+
+
+def _extract_balance(account: dict[str, Any]) -> tuple[float | None, Any]:
+    """Best-effort balance from ``GetAccountInfo``; returns (parsed, raw) for debugging."""
+    client_info = _client_info_dict(account)
+    if client_info is not None:
+        for key in (
+            "balance",
+            "Balance",
+            "saldo",
+            "Saldo",
+            "credit",
+            "Credit",
+            "account_balance",
+        ):
+            if key not in client_info:
+                continue
+            raw = client_info[key]
+            parsed = _parse_balance_number(raw)
+            if parsed is not None:
+                return (parsed, raw)
+
+    for key in (
+        "balance",
+        "saldo",
+        "Balance",
+        "Saldo",
+        "credit",
+        "Credit",
+        "account_balance",
+        "AccountBalance",
+    ):
+        if key not in account:
+            continue
+        raw = account[key]
+        parsed = _parse_balance_number(raw)
+        if parsed is not None:
+            return (parsed, raw)
+
+    return (None, None)
 
 
 def _normalize_sims(sims_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -114,6 +183,158 @@ def _normalize_container_list(
         vals = [v for v in raw.values() if isinstance(v, dict)]
         return vals
     _LOGGER.debug("Unexpected container type for %s: %s", primary, type(raw).__name__)
+    return []
+
+
+_SUBSCRIPTION_LIST_KEYS: tuple[str, ...] = (
+    "Subscriptions",
+    "subscriptions",
+    "Subscription",
+    "subscription",
+    "SubscriptionList",
+    "subscription_list",
+    "SubscriptionsList",
+    "subscriptions_list",
+    "Rows",
+    "rows",
+    "Items",
+    "items",
+    "List",
+    "list",
+)
+
+_SUBSCRIPTION_PAYLOAD_WRAPPERS: tuple[str, ...] = (
+    "data",
+    "result",
+    "Result",
+    "Data",
+    "payload",
+    "response",
+    "Response",
+    "body",
+)
+
+_SUBSCRIPTION_ROW_MARKERS: tuple[str, ...] = (
+    "subscription_id",
+    "SubscriptionID",
+    "subscriptionId",
+    "ICCID",
+    "iccid",
+    "MSISDN",
+    "msisdn",
+    "product_description",
+    "ProductDescription",
+    "sim_description",
+)
+
+
+def _subscription_payload_bases(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Unwrap common outer keys so list fields may live one level down."""
+    bases: list[dict[str, Any]] = [payload]
+    for w in _SUBSCRIPTION_PAYLOAD_WRAPPERS:
+        inner = payload.get(w)
+        if isinstance(inner, dict):
+            bases.append(inner)
+    return bases
+
+
+def _inject_subscription_id_from_mapping_key(
+    mapping: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """When API returns ``{ "<id>": { ... } }`` without ``subscription_id`` inside each row."""
+    out: list[dict[str, Any]] = []
+    for k, v in mapping.items():
+        if not isinstance(v, dict):
+            continue
+        row = dict(v)
+        if row.get("subscription_id") is None:
+            ks = str(k).strip()
+            if ks.isdigit():
+                row["subscription_id"] = int(ks)
+            elif ks:
+                row["subscription_id"] = ks
+        out.append(row)
+    return out
+
+
+def _normalize_subscription_container(base: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse ``GetSubscriptions``-shaped JSON into subscription dict rows."""
+    raw: Any = None
+    used_key: str | None = None
+    for pk in _SUBSCRIPTION_LIST_KEYS:
+        if pk in base:
+            raw = base[pk]
+            used_key = pk
+            break
+    if raw is None:
+        return []
+
+    if isinstance(raw, list):
+        rows = [x for x in raw if isinstance(x, dict)]
+        _ensure_subscription_ids(rows)
+        return [r for r in rows if r.get("subscription_id") not in (None, "")]
+
+    if isinstance(raw, dict):
+        if any(m in raw for m in _SUBSCRIPTION_ROW_MARKERS):
+            row = dict(raw)
+            _ensure_subscription_id(row)
+            return [row] if row.get("subscription_id") not in (None, "") else []
+
+        vals = [v for v in raw.values() if isinstance(v, dict)]
+        if vals:
+            if all(
+                v.get("subscription_id") is None
+                and v.get("SubscriptionID") is None
+                for v in vals
+            ):
+                injected = _inject_subscription_id_from_mapping_key(raw)
+                _ensure_subscription_ids(injected)
+                if injected:
+                    return [
+                        r
+                        for r in injected
+                        if r.get("subscription_id") not in (None, "")
+                    ]
+            _ensure_subscription_ids(vals)
+            return [r for r in vals if r.get("subscription_id") not in (None, "")]
+
+        _LOGGER.debug(
+            "GetSubscriptions key %s had dict without recognizable subscription rows; keys=%s",
+            used_key,
+            list(raw.keys())[:25],
+        )
+        return []
+
+    _LOGGER.debug(
+        "Unexpected GetSubscriptions container type for key %s: %s",
+        used_key,
+        type(raw).__name__,
+    )
+    return []
+
+
+def _ensure_subscription_id(row: dict[str, Any]) -> None:
+    """Normalize alternate id keys onto ``subscription_id``."""
+    if row.get("subscription_id") not in (None, ""):
+        return
+    for alt in ("SubscriptionID", "subscriptionId", "sub_id", "SubId"):
+        v = row.get(alt)
+        if v is not None and str(v).strip():
+            row["subscription_id"] = v
+            return
+
+
+def _ensure_subscription_ids(rows: list[dict[str, Any]]) -> None:
+    for r in rows:
+        _ensure_subscription_id(r)
+
+
+def _normalize_subscription_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect subscription rows from top-level and common wrapper dicts."""
+    for base in _subscription_payload_bases(payload):
+        rows = _normalize_subscription_container(base)
+        if rows:
+            return rows
     return []
 
 
@@ -239,7 +460,7 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
             _LOGGER.warning("SIM list response was not a dict; coercing to empty")
             sims_raw = {}
 
-        balance = _extract_balance(account)
+        balance, balance_raw = _extract_balance(account)
         sims = _normalize_sims(sims_raw)
         sim_iccids = _sim_iccid_set(sims)
 
@@ -252,18 +473,16 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
             _LOGGER.warning("GetSubscriptions failed: %s", err)
             sub_payload = {}
 
-        sub_rows = _normalize_container_list(
-            sub_payload, "Subscriptions", ("subscriptions", "Subscription")
-        )
-
-        vg_map: dict[int, dict[str, Any]] = {}
-        try:
-            vg_raw = await self.client.async_get_volume_groups(None)
-            vg_map = _volume_groups_map(vg_raw)
-        except OpenM2MError as err:
-            _LOGGER.warning("GetVolumeGroups failed: %s", err)
+        sub_rows = _normalize_subscription_rows(sub_payload)
+        if not sub_rows and isinstance(sub_payload, dict) and sub_payload:
+            _LOGGER.debug(
+                "GetSubscriptions succeeded but parsed 0 subscription rows; "
+                "top-level keys: %s",
+                sorted(str(k) for k in sub_payload.keys()),
+            )
 
         async def enrich_one(row: dict[str, Any]) -> dict[str, Any]:
+            _ensure_subscription_id(row)
             sid = row.get("subscription_id")
             sid_s = str(sid).strip() if sid is not None else ""
             if not sid_s:
@@ -293,11 +512,26 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
             seen_vg: set[int] = set()
             has_vg_numbers = False
 
-            try:
-                db_raw = await self.client.async_get_databundles(sid_s)
-            except OpenM2MError as err:
-                _LOGGER.debug("GetDatabundles(%s) failed: %s", sid_s, err)
-                db_raw = {}
+            db_raw: dict[str, Any] = {}
+            vg_raw_sub: dict[str, Any] = {}
+            g_res = await asyncio.gather(
+                self.client.async_get_databundles(sid_s),
+                self.client.async_get_volume_groups(sid_s),
+                return_exceptions=True,
+            )
+            for idx, label in enumerate(("GetDatabundles", "GetVolumeGroups")):
+                item = g_res[idx]
+                if isinstance(item, OpenM2MError):
+                    _LOGGER.debug("%s(%s) failed: %s", label, sid_s, item)
+                elif isinstance(item, Exception):
+                    _LOGGER.warning("%s(%s) unexpected: %s", label, sid_s, item)
+                elif isinstance(item, dict):
+                    if idx == 0:
+                        db_raw = item
+                    else:
+                        vg_raw_sub = item
+
+            vg_map_local = _volume_groups_map(vg_raw_sub)
 
             bundles = _normalize_container_list(
                 db_raw, "Databundles", ("databundles", "Databundle")
@@ -314,7 +548,9 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
                         vgid = int(vgid_raw)
                     except (TypeError, ValueError):
                         vgid = None
-                vg_row: dict[str, Any] | None = vg_map.get(vgid) if vgid is not None else None
+                vg_row: dict[str, Any] | None = (
+                    vg_map_local.get(vgid) if vgid is not None else None
+                )
                 used_mb: float | None = None
                 vol_mb: float | None = None
                 if vg_row is not None and vgid is not None and vgid not in seen_vg:
@@ -441,10 +677,13 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
         else:
             aggregate_remaining = None
 
-        return OpenM2MCoordinatorData(
-            account=account,
-            account_balance=balance,
-            sims=sims,
-            subscriptions=subscriptions,
-            subscriptions_aggregate_remaining_bytes=aggregate_remaining,
-        )
+        data: OpenM2MCoordinatorData = {
+            "account": account,
+            "account_balance": balance,
+            "sims": sims,
+            "subscriptions": subscriptions,
+            "subscriptions_aggregate_remaining_bytes": aggregate_remaining,
+        }
+        if balance_raw is not None:
+            data["account_balance_raw"] = balance_raw
+        return data
