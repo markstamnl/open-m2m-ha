@@ -21,6 +21,16 @@ Source and behavior details: [`custom_components/open_m2m/`](custom_components/o
 
 **Settings** → **Devices & services** → **Add integration** → **Open-M2M** (domain `open_m2m`) — API key in the config flow. Cloud polling hub (`iot_class` in `manifest.json`).
 
+## Releases
+
+After bumping `custom_components/open_m2m/manifest.json` and `CHANGELOG.md` on the commit you intend to ship, create and push a semver tag (must point at that released code):
+
+```bash
+git tag v1.0.2 && git push origin v1.0.2
+```
+
+Adjust the version as needed. The [Release workflow](.github/workflows/release.yml) runs on `v*` tag pushes and publishes a GitHub Release (auto-generated release notes from merged PRs and commits).
+
 ## Features
 
 - **Account** — balance and account-oriented sensors.
