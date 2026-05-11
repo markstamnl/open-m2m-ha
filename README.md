@@ -26,10 +26,11 @@ Behavior and API notes: [`custom_components/open_m2m/README.md`](custom_componen
 After bumping `custom_components/open_m2m/manifest.json` and `CHANGELOG.md` on the commit you intend to ship, create and push a semver tag (must point at that released code):
 
 ```bash
-git tag v1.0.2 && git push origin v1.0.2
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-Adjust the version as needed. The [Release workflow](.github/workflows/release.yml) runs on `v*` tag pushes and publishes a GitHub Release (auto-generated release notes from merged PRs and commits).
+Replace `X.Y.Z` with the semver you are shipping (aligned with `version` in `manifest.json`). The latest release tag is shown on GitHub under **Releases** (not duplicated here to avoid drift). The [Release workflow](.github/workflows/release.yml) runs on `v*` tag pushes and publishes a GitHub Release (auto-generated release notes from merged PRs and commits).
 
 ## Features
 
