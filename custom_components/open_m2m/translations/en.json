@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Open-M2M",
+        "description": "Enter your Open-M2M API key. You can find or create one in the Open-M2M portal under your account settings.",
+        "data": {
+          "api_key": "API key"
+        },
+        "data_description": {
+          "api_key": "Sent with every request as the `apikey` form field."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Open-M2M.",
+      "invalid_auth": "Invalid API key.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This API key is already configured."
+    }
+  }
+}

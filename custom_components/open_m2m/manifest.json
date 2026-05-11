@@ -1,0 +1,13 @@
+{
+  "domain": "open_m2m",
+  "name": "Open-M2M",
+  "codeowners": ["@markstamnl"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/markstamnl/open-m2m-ha",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/markstamnl/open-m2m-ha/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
