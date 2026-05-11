@@ -2,92 +2,92 @@
   "config": {
     "step": {
       "user": {
-        "title": "Connect to Open-M2M",
-        "description": "Enter your Open-M2M API key. You can find or create one in the Open-M2M portal under your account settings.",
+        "title": "Verbinden met Open-M2M",
+        "description": "Voer je Open-M2M API-sleutel in. Je vindt of maakt er een aan in het Open-M2M-portaal onder je accountinstellingen.",
         "data": {
-          "api_key": "API key"
+          "api_key": "API-sleutel"
         },
         "data_description": {
-          "api_key": "Sent with every request as the `apikey` form field."
+          "api_key": "Wordt bij elk verzoek meegestuurd als het `apikey`-formulierveld."
         }
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to Open-M2M.",
-      "invalid_auth": "Invalid API key.",
-      "unknown": "Unexpected error."
+      "cannot_connect": "Kan geen verbinding maken met Open-M2M.",
+      "invalid_auth": "Ongeldige API-sleutel.",
+      "unknown": "Onverwachte fout."
     },
     "abort": {
-      "already_configured": "This API key is already configured."
+      "already_configured": "Deze API-sleutel is al geconfigureerd."
     }
   },
   "entity": {
     "sensor": {
       "account_balance": {
-        "name": "Account balance"
+        "name": "Account saldo"
       },
       "sim_count": {
-        "name": "SIM count"
+        "name": "Aantal SIM-kaarten"
       },
       "subscription_count": {
-        "name": "Subscription count"
+        "name": "Aantal abonnementen"
       },
       "subscriptions_aggregate_remaining": {
-        "name": "Data remaining"
+        "name": "Resterende data (totaal)"
       },
       "sim_subscription_status": {
-        "name": "Subscription status"
+        "name": "Abonnementsstatus"
       },
       "sim_data_usage": {
-        "name": "Data usage"
+        "name": "Dataverbruik"
       },
       "sim_plan_data_included": {
-        "name": "Plan data included"
+        "name": "Inbegrepen data (abonnement)"
       },
       "subscription_portal_status": {
         "name": "Status"
       },
       "subscription_data_used": {
-        "name": "Data used"
+        "name": "Dataverbruik"
       },
       "subscription_data_allowance": {
-        "name": "Data allowance"
+        "name": "Datalimiet"
       },
       "subscription_bundle": {
-        "name": "Bundle"
+        "name": "Bundel"
       },
       "subscription_auto_renew": {
-        "name": "Auto renew"
+        "name": "Automatisch verlengen"
       },
       "subscription_expire": {
-        "name": "Expire time"
+        "name": "Vervaldatum"
       },
       "subscription_start": {
-        "name": "Start time"
+        "name": "Startdatum"
       },
       "subscription_msisdn": {
         "name": "MSISDN"
       },
       "subscription_ip": {
-        "name": "IP"
+        "name": "IP-adres"
       },
       "subscription_hostname": {
-        "name": "Hostname"
+        "name": "Hostnaam"
       },
       "subscription_radius_status": {
-        "name": "RADIUS status"
+        "name": "RADIUS-status"
       },
       "subscription_product": {
         "name": "Product"
       },
       "subscription_monthly_plan": {
-        "name": "Monthly plan"
+        "name": "Maandabonnement"
       },
       "subscription_dataproduct_data_included": {
-        "name": "Data included"
+        "name": "Inbegrepen data (databundel)"
       },
       "subscription_imei_lock": {
-        "name": "IMEI lock"
+        "name": "IMEI-vergrendeling"
       },
       "databundle_status": {
         "name": "Status{suffix}"
@@ -96,10 +96,10 @@
         "name": "Start{suffix}"
       },
       "databundle_expire": {
-        "name": "Expiry{suffix}"
+        "name": "Vervaldatum{suffix}"
       },
       "databundle_monthly": {
-        "name": "Monthly{suffix}"
+        "name": "Maandprijs{suffix}"
       }
     }
   }

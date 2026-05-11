@@ -2,6 +2,10 @@
 
 Portal API integration for [Open-M2M](https://portal.open-m2m.com/). **Install and My HA badges:** [repository README](https://github.com/markstamnl/open-m2m-ha/blob/main/README.md).
 
+After updating, **UI display names** (friendly names) may become shorter while **`entity_id` and `unique_id` stay the same**—YAML that references `sensor.open_m2m_…` does not need changes. Rename entities in **Settings → Devices & services → Entities** if you prefer different labels.
+
+Entity **names** in the UI follow Home Assistant’s translation system: each sensor sets a stable `translation_key`, and strings live under `translations/en.json` and `translations/nl.json` in the `entity.sensor` section (add more locale files the same way).
+
 ## Entities (overview)
 
 | Area | Device / model | Notes |

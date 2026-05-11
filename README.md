@@ -15,7 +15,7 @@ Home Assistant custom integration for the [Open-M2M](https://portal.open-m2m.com
 
 **Manual:** Copy `custom_components/open_m2m/` next to `configuration.yaml` and restart.
 
-Source and behavior details: [`custom_components/open_m2m/`](custom_components/open_m2m/). Brand images live under `custom_components/open_m2m/brand/` (served on Home Assistant **2026.3+**).
+Source and behavior details: [`custom_components/open_m2m/`](custom_components/open_m2m/). Brand images live under `custom_components/open_m2m/brand/` (served on Home Assistant **2026.3+**). Dutch translations via `translations/nl.json`.
 
 ## Configuration
 

@@ -25,6 +25,9 @@ from .coordinator import OpenM2MCoordinator, OpenM2MCoordinatorData
 
 _LOGGER = logging.getLogger(__name__)
 
+# Hub device for account-level sensors (balance, counts); stable via entry_id identifier.
+_ACCOUNT_HUB_DEVICE_NAME = "Open-M2M account"
+
 
 def _client_info_for_attrs(account: dict[str, Any]) -> dict[str, Any] | None:
     """Match coordinator client-info key variants for balance debug attributes."""
@@ -39,6 +42,97 @@ def _slug_suffix(value: str, *, max_len: int = 32) -> str:
     """Build a stable object-id suffix from ICCID or subscription id."""
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
     return cleaned[:max_len] if cleaned else "sim"
+
+
+def _id_tail_for_display(raw: str, *, max_digits: int = 8) -> str:
+    """Last digits (or short alnum tail) for compact device labels; max ~8 digits."""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= max_digits:
+        return digits[-max_digits:]
+    if len(digits) >= 6:
+        return digits[-6:]
+    if digits:
+        return digits
+    alnum = re.sub(r"[^a-zA-Z0-9]", "", raw)
+    if len(alnum) > max_digits:
+        return alnum[-max_digits:]
+    return alnum or raw
+
+
+def _open_m2m_sim_device_title(iccid: str) -> str:
+    """Short hub-facing SIM device title: Open-M2M + tail of ICCID / sub id."""
+    return f"Open-M2M {_id_tail_for_display(iccid)}"
+
+
+def _subscription_device_title(sub: dict[str, Any]) -> str:
+    """Short subscription device name; matches SIM title when ICCID aligns."""
+    iccid_raw = sub.get("iccid")
+    if isinstance(iccid_raw, str) and iccid_raw.strip():
+        return _open_m2m_sim_device_title(iccid_raw.strip().upper())
+    sid = sub.get("subscription_id")
+    if sid is not None and str(sid).strip():
+        return f"Sub {sid}"
+    ident = sub.get("device_identifier")
+    if isinstance(ident, str) and ident.strip():
+        return f"Sub {_id_tail_for_display(ident)}"
+    return "Sub unknown"
+
+
+def _databundle_disambig_suffix(row: dict[str, Any]) -> str:
+    """Short suffix when multiple databundles share one device (merged onto SIM)."""
+    dbid = row.get("databundle_id")
+    if dbid is not None and str(dbid).strip():
+        return _id_tail_for_display(str(dbid), max_digits=6)
+    vg = row.get("volumegroup_id")
+    if vg is not None and str(vg).strip():
+        return _id_tail_for_display(str(vg), max_digits=6)
+    lid = row.get("linked_subscription_id")
+    if lid is not None and str(lid).strip():
+        return _id_tail_for_display(str(lid), max_digits=6)
+    return ""
+
+
+def _databundle_bundle_device_title(row: dict[str, Any]) -> str:
+    """Standalone databundle device (not merged onto SIM)."""
+    dbid = row.get("databundle_id")
+    if dbid is not None and str(dbid).strip():
+        return f"Bundle {dbid}"
+    lid = row.get("linked_subscription_id")
+    if lid is not None and str(lid).strip():
+        return f"Bundle sub {lid}"
+    ident = row.get("device_identifier")
+    if isinstance(ident, str) and ident.strip():
+        return f"Bundle {_id_tail_for_display(ident)}"
+    return "Bundle"
+
+
+def _databundle_translation_suffix(row: dict[str, Any]) -> str:
+    """Placeholder for translated names when several databundles share one SIM device."""
+    if not row.get("merged_onto_sim"):
+        return ""
+    suf = _databundle_disambig_suffix(row)
+    return f" {suf}" if suf else ""
+
+
+def _sim_device_info(
+    entry: ConfigEntry,
+    iccid: str,
+    sim: dict[str, Any],
+) -> DeviceInfo:
+    """Shared SIM ``DeviceInfo`` for SIM sensors and merged databundles."""
+    product = _product_info(sim)
+    model = (
+        product.get("description")
+        if isinstance(product.get("description"), str)
+        else None
+    )
+    return DeviceInfo(
+        identifiers={(DOMAIN, iccid)},
+        name=_open_m2m_sim_device_title(iccid),
+        manufacturer="Open-M2M",
+        model=model or "SIM",
+        via_device=(DOMAIN, entry.entry_id),
+    )
 
 
 def _sim_iccid(sim: dict[str, Any]) -> str | None:
@@ -191,45 +285,17 @@ def _databundle_device_info(
                     sim_row = s
                     break
         sim = sim_row or {}
-        name = sim.get("description") if isinstance(sim.get("description"), str) else None
-        product = _product_info(sim)
-        model = (
-            product.get("description")
-            if isinstance(product.get("description"), str)
-            else None
-        )
-        return DeviceInfo(
-            identifiers={(DOMAIN, iccid)},
-            name=name or f"SIM {iccid}",
-            manufacturer="Open-M2M",
-            model=model or "SIM",
-            via_device=(DOMAIN, entry.entry_id),
-        )
+        # Use row ICCID string as identifier (same as pre-refactor merged databundles).
+        return _sim_device_info(entry, iccid, sim)
 
     ident = row.get("device_identifier")
     if not isinstance(ident, str) or not ident:
         ident = f"sub_{row.get('linked_subscription_id') or 'unknown'}"
-    sub_row: dict[str, Any] | None = None
-    lid = row.get("linked_subscription_id")
-    if lid is not None and coordinator.data:
-        for s in coordinator.data.get("subscriptions", []):
-            if isinstance(s, dict) and str(s.get("subscription_id")) == str(lid):
-                sub_row = s
-                break
-    sub = sub_row or {}
-    name_bits: list[str] = []
-    if isinstance(sub.get("sim_description"), str):
-        name_bits.append(sub["sim_description"])
-    if isinstance(sub.get("product_name"), str):
-        name_bits.append(sub["product_name"])
-    dev_name = (
-        " / ".join(name_bits) if name_bits else f"Subscription {lid or ident}"
-    )
     return DeviceInfo(
         identifiers={(DOMAIN, ident)},
-        name=dev_name,
+        name=_databundle_bundle_device_title(row),
         manufacturer="Open-M2M",
-        model="Subscription",
+        model="Databundle",
         via_device=(DOMAIN, entry.entry_id),
     )
 
@@ -283,7 +349,7 @@ def _build_subscription_sensors(
 class OpenM2MBaseSensor(CoordinatorEntity[OpenM2MCoordinator], SensorEntity):
     """Common base for Open-M2M sensors."""
 
-    _attr_has_entity_name = False
+    _attr_has_entity_name = True
 
     def __init__(
         self,
@@ -307,7 +373,10 @@ class OpenM2MAccountBalanceSensor(OpenM2MBaseSensor):
     ) -> None:
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_account_balance"
-        self._attr_name = "Open-M2M account balance"
+        self.entity_description = SensorEntityDescription(
+            key="account_balance",
+            translation_key="account_balance",
+        )
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -350,8 +419,6 @@ class OpenM2MSimCountSensor(OpenM2MBaseSensor):
     """Number of SIMs returned by ``GetSIMs``."""
 
     _attr_icon = "mdi:sim"
-    _attr_native_unit_of_measurement = "SIMs"
-    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(
         self,
@@ -360,13 +427,18 @@ class OpenM2MSimCountSensor(OpenM2MBaseSensor):
     ) -> None:
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_sim_count"
-        self._attr_name = "Open-M2M SIM count"
+        self.entity_description = SensorEntityDescription(
+            key="sim_count",
+            translation_key="sim_count",
+            native_unit_of_measurement="SIMs",
+            state_class=SensorStateClass.TOTAL,
+        )
 
     @property
     def device_info(self) -> DeviceInfo:
         return DeviceInfo(
             identifiers={(DOMAIN, self._entry.entry_id)},
-            name="Open-M2M",
+            name=_ACCOUNT_HUB_DEVICE_NAME,
             manufacturer="Open-M2M",
             model="Account",
         )
@@ -383,7 +455,6 @@ class OpenM2MSubscriptionCountSensor(OpenM2MBaseSensor):
     """Count of subscriptions from ``GetSubscriptions``."""
 
     _attr_icon = "mdi:card-account-details"
-    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(
         self,
@@ -392,13 +463,17 @@ class OpenM2MSubscriptionCountSensor(OpenM2MBaseSensor):
     ) -> None:
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_subscription_count"
-        self._attr_name = "Open-M2M subscription count"
+        self.entity_description = SensorEntityDescription(
+            key="subscription_count",
+            translation_key="subscription_count",
+            state_class=SensorStateClass.TOTAL,
+        )
 
     @property
     def device_info(self) -> DeviceInfo:
         return DeviceInfo(
             identifiers={(DOMAIN, self._entry.entry_id)},
-            name="Open-M2M",
+            name=_ACCOUNT_HUB_DEVICE_NAME,
             manufacturer="Open-M2M",
             model="Account",
         )
@@ -421,9 +496,9 @@ class OpenM2MSubscriptionsAggregateRemainingSensor(OpenM2MBaseSensor):
     ) -> None:
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_subscriptions_data_remaining"
-        self._attr_name = "Open-M2M subscriptions data remaining (aggregate)"
         self.entity_description = SensorEntityDescription(
             key="subscriptions_aggregate_remaining",
+            translation_key="subscriptions_aggregate_remaining",
             device_class=SensorDeviceClass.DATA_SIZE,
             native_unit_of_measurement=UnitOfInformation.BYTES,
             state_class=SensorStateClass.MEASUREMENT,
@@ -434,7 +509,7 @@ class OpenM2MSubscriptionsAggregateRemainingSensor(OpenM2MBaseSensor):
     def device_info(self) -> DeviceInfo:
         return DeviceInfo(
             identifiers={(DOMAIN, self._entry.entry_id)},
-            name="Open-M2M",
+            name=_ACCOUNT_HUB_DEVICE_NAME,
             manufacturer="Open-M2M",
             model="Account",
         )
@@ -478,16 +553,7 @@ class OpenM2MSimSensorBase(OpenM2MBaseSensor):
     @property
     def device_info(self) -> DeviceInfo:
         sim = self._current_sim() or self._sim_static
-        name = sim.get("description") if isinstance(sim.get("description"), str) else None
-        product = _product_info(sim)
-        model = product.get("description") if isinstance(product.get("description"), str) else None
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._iccid)},
-            name=name or f"SIM {self._iccid}",
-            manufacturer="Open-M2M",
-            model=model or "SIM",
-            via_device=(DOMAIN, self._entry.entry_id),
-        )
+        return _sim_device_info(self._entry, self._iccid, sim)
 
 
 class OpenM2MSimSubscriptionSensor(OpenM2MSimSensorBase):
@@ -505,7 +571,7 @@ class OpenM2MSimSubscriptionSensor(OpenM2MSimSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sim, iccid, slug_suffix)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_subscription_status"
-        self._attr_name = f"Open-M2M SIM {iccid} subscription status"
+        self._attr_translation_key = "sim_subscription_status"
 
     @property
     def native_value(self) -> str | None:
@@ -552,7 +618,7 @@ class OpenM2MSimDataUsageSensor(OpenM2MSimSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sim, iccid, slug_suffix)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_data_usage_kb"
-        self._attr_name = f"Open-M2M SIM {iccid} data usage"
+        self._attr_translation_key = "sim_data_usage"
 
     @property
     def native_value(self) -> float | str | None:
@@ -582,7 +648,7 @@ class OpenM2MSimPlanAllowanceSensor(OpenM2MSimSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sim, iccid, slug_suffix)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_plan_data_included"
-        self._attr_name = f"Open-M2M SIM {iccid} plan data included"
+        self._attr_translation_key = "sim_plan_data_included"
 
     @property
     def native_value(self) -> int | str | None:
@@ -626,15 +692,9 @@ class OpenM2MSubscriptionSensorBase(OpenM2MBaseSensor):
         ident = sub.get("device_identifier") or self._sub_static.get("device_identifier")
         if not isinstance(ident, str) or not ident:
             ident = f"sub_{self._subscription_id}"
-        name_bits: list[str] = []
-        if isinstance(sub.get("sim_description"), str):
-            name_bits.append(sub["sim_description"])
-        if isinstance(sub.get("product_name"), str):
-            name_bits.append(sub["product_name"])
-        dev_name = " / ".join(name_bits) if name_bits else f"Subscription {self._subscription_id}"
         return DeviceInfo(
             identifiers={(DOMAIN, ident)},
-            name=dev_name,
+            name=_subscription_device_title(sub),
             manufacturer="Open-M2M",
             model="Subscription",
             via_device=(DOMAIN, self._entry.entry_id),
@@ -660,7 +720,7 @@ class OpenM2MSubscriptionPortalStatusSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_subscription_status"
-        self._attr_name = f"Open-M2M subscription {label} portal status"
+        self._attr_translation_key = "subscription_portal_status"
 
     @property
     def native_value(self) -> str | None:
@@ -717,9 +777,9 @@ class OpenM2MSubscriptionDataUsedSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_data_used"
-        self._attr_name = f"Open-M2M subscription {label} data used"
         self.entity_description = SensorEntityDescription(
             key="subscription_data_used",
+            translation_key="subscription_data_used",
             device_class=SensorDeviceClass.DATA_SIZE,
             native_unit_of_measurement=UnitOfInformation.BYTES,
             state_class=SensorStateClass.MEASUREMENT,
@@ -748,9 +808,9 @@ class OpenM2MSubscriptionDataAllowanceSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_data_allowance"
-        self._attr_name = f"Open-M2M subscription {label} data allowance"
         self.entity_description = SensorEntityDescription(
             key="subscription_data_allowance",
+            translation_key="subscription_data_allowance",
             device_class=SensorDeviceClass.DATA_SIZE,
             native_unit_of_measurement=UnitOfInformation.BYTES,
             state_class=SensorStateClass.MEASUREMENT,
@@ -800,7 +860,7 @@ class OpenM2MSubscriptionBundleSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_bundle"
-        self._attr_name = f"Open-M2M subscription {label} bundle"
+        self._attr_translation_key = "subscription_bundle"
 
     @property
     def native_value(self) -> str | None:
@@ -843,7 +903,7 @@ class OpenM2MSubscriptionAutoRenewSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_auto_renew"
-        self._attr_name = f"Open-M2M subscription {label} auto renew"
+        self._attr_translation_key = "subscription_auto_renew"
 
     @property
     def native_value(self) -> str | None:
@@ -869,9 +929,9 @@ class OpenM2MSubscriptionExpireSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_expire"
-        self._attr_name = f"Open-M2M subscription {label} expire time"
         self.entity_description = SensorEntityDescription(
             key="subscription_expire",
+            translation_key="subscription_expire",
             device_class=SensorDeviceClass.TIMESTAMP,
         )
 
@@ -899,9 +959,9 @@ class OpenM2MSubscriptionStartSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_start"
-        self._attr_name = f"Open-M2M subscription {label} start time"
         self.entity_description = SensorEntityDescription(
             key="subscription_start",
+            translation_key="subscription_start",
             device_class=SensorDeviceClass.TIMESTAMP,
         )
 
@@ -931,7 +991,7 @@ class OpenM2MSubscriptionMsisdnSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_msisdn"
-        self._attr_name = f"Open-M2M subscription {label} MSISDN"
+        self._attr_translation_key = "subscription_msisdn"
 
     @property
     def native_value(self) -> str | None:
@@ -957,7 +1017,7 @@ class OpenM2MSubscriptionIpSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_ip"
-        self._attr_name = f"Open-M2M subscription {label} IP"
+        self._attr_translation_key = "subscription_ip"
 
     @property
     def native_value(self) -> str | None:
@@ -983,7 +1043,7 @@ class OpenM2MSubscriptionHostnameSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_hostname"
-        self._attr_name = f"Open-M2M subscription {label} hostname"
+        self._attr_translation_key = "subscription_hostname"
 
     @property
     def native_value(self) -> str | None:
@@ -1009,7 +1069,7 @@ class OpenM2MSubscriptionRadiusStatusSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_radius_status"
-        self._attr_name = f"Open-M2M subscription {label} RADIUS status"
+        self._attr_translation_key = "subscription_radius_status"
 
     @property
     def native_value(self) -> str | None:
@@ -1035,7 +1095,7 @@ class OpenM2MSubscriptionProductDescriptionSensor(OpenM2MSubscriptionSensorBase)
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_product_description"
-        self._attr_name = f"Open-M2M subscription {label} product description"
+        self._attr_translation_key = "subscription_product"
 
     @property
     def native_value(self) -> str | None:
@@ -1064,7 +1124,7 @@ class OpenM2MSubscriptionMonthlySensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_monthly"
-        self._attr_name = f"Open-M2M subscription {label} monthly plan"
+        self._attr_translation_key = "subscription_monthly_plan"
 
     @property
     def native_value(self) -> str | None:
@@ -1090,9 +1150,9 @@ class OpenM2MSubscriptionDataproductIncludedSensor(OpenM2MSubscriptionSensorBase
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_portal_dataproduct_data_included"
-        self._attr_name = f"Open-M2M subscription {label} DataProduct data included"
         self.entity_description = SensorEntityDescription(
             key="subscription_dataproduct_data_included",
+            translation_key="subscription_dataproduct_data_included",
             device_class=SensorDeviceClass.DATA_SIZE,
             native_unit_of_measurement=UnitOfInformation.BYTES,
             state_class=SensorStateClass.MEASUREMENT,
@@ -1157,7 +1217,10 @@ class OpenM2MDatabundleStatusSensor(OpenM2MDatabundleSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, row, slug, label, match)
         self._attr_unique_id = f"{entry.entry_id}_{slug}_databundle_status"
-        self._attr_name = f"Open-M2M databundle {label} status"
+        self._attr_translation_key = "databundle_status"
+        self._attr_translation_placeholders = {
+            "suffix": _databundle_translation_suffix(row),
+        }
 
     @property
     def native_value(self) -> str | None:
@@ -1199,11 +1262,14 @@ class OpenM2MDatabundleStartSensor(OpenM2MDatabundleSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, row, slug, label, match)
         self._attr_unique_id = f"{entry.entry_id}_{slug}_databundle_start"
-        self._attr_name = f"Open-M2M databundle {label} start time"
         self.entity_description = SensorEntityDescription(
             key="databundle_start",
+            translation_key="databundle_start",
             device_class=SensorDeviceClass.TIMESTAMP,
         )
+        self._attr_translation_placeholders = {
+            "suffix": _databundle_translation_suffix(row),
+        }
 
     @property
     def native_value(self) -> datetime | None:
@@ -1230,11 +1296,14 @@ class OpenM2MDatabundleExpireSensor(OpenM2MDatabundleSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, row, slug, label, match)
         self._attr_unique_id = f"{entry.entry_id}_{slug}_databundle_expire"
-        self._attr_name = f"Open-M2M databundle {label} expire time"
         self.entity_description = SensorEntityDescription(
             key="databundle_expire",
+            translation_key="databundle_expire",
             device_class=SensorDeviceClass.TIMESTAMP,
         )
+        self._attr_translation_placeholders = {
+            "suffix": _databundle_translation_suffix(row),
+        }
 
     @property
     def native_value(self) -> datetime | None:
@@ -1263,7 +1332,10 @@ class OpenM2MDatabundleMonthlySensor(OpenM2MDatabundleSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, row, slug, label, match)
         self._attr_unique_id = f"{entry.entry_id}_{slug}_databundle_monthly"
-        self._attr_name = f"Open-M2M databundle {label} monthly"
+        self._attr_translation_key = "databundle_monthly"
+        self._attr_translation_placeholders = {
+            "suffix": _databundle_translation_suffix(row),
+        }
         self._attr_native_unit_of_measurement = "EUR"
         self._attr_suggested_display_precision = 2
 
@@ -1297,7 +1369,7 @@ class OpenM2MSubscriptionImeiLockSensor(OpenM2MSubscriptionSensorBase):
     ) -> None:
         super().__init__(coordinator, entry, sub, slug_suffix, label)
         self._attr_unique_id = f"{entry.entry_id}_{slug_suffix}_diag_imei_lock"
-        self._attr_name = f"Open-M2M subscription {label} IMEI lock"
+        self._attr_translation_key = "subscription_imei_lock"
 
     @property
     def native_value(self) -> str | None:
