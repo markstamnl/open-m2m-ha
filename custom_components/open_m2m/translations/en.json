@@ -35,6 +35,12 @@
       "subscriptions_aggregate_remaining": {
         "name": "Data remaining"
       },
+      "usage_total_current_month": {
+        "name": "Usage (this month)"
+      },
+      "usage_total_previous_month": {
+        "name": "Usage (last month)"
+      },
       "sim_subscription_status": {
         "name": "Subscription status"
       },

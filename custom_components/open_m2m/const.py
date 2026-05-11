@@ -24,10 +24,23 @@ MAX_DATABUNDLES = 20
 ENDPOINT_TEST_API = "/TestAPI"
 ENDPOINT_ACCOUNT_INFO = "/GetAccountInfo"
 ENDPOINT_SIMS = "/GetSIMs"
+# Single-SIM detail (OpenAPI v1.0.7); response wraps the row in ``SIM``.
+ENDPOINT_GET_SIM = "/GetSIM"
+ENDPOINT_SIM_DETAIL = ENDPOINT_GET_SIM  # OpenAPI name ``GetSIM``
+# Cap ``GetSIM`` calls per coordinator refresh (enrichment when list lacks description).
+MAX_SIM_DETAIL_ENRICHMENT_PER_REFRESH = 5
+# Cap ``GetProductInfo`` calls per coordinator refresh (unique ``product_id``).
+MAX_PRODUCT_INFO_FETCHES = 5
+# Cap ``GetUsageTotals`` subscription-scoped retries when account-level call yields no CDR.
+MAX_USAGE_TOTALS_SUBSCRIPTION_TRIES = 3
 # Subscriptions / bundles (OpenAPI v1.0.7)
 ENDPOINT_GET_SUBSCRIPTIONS = "/GetSubscriptions"
 ENDPOINT_GET_SUBSCRIPTION_INFO = "/GetSubscriptionInfo"
+# Product catalog row (OpenAPI v1.0.7); POST body uses ``product_id`` (snake_case),
+# same style as ``subscription_id`` on other endpoints (see README / SwaggerHub).
+ENDPOINT_PRODUCT_INFO = "/GetProductInfo"
 ENDPOINT_GET_DATABUNDLES = "/GetDatabundles"
 ENDPOINT_GET_VOLUME_GROUPS = "/GetVolumeGroups"
+ENDPOINT_USAGE_TOTALS = "/GetUsageTotals"
 ENDPOINT_SUSPEND_SIM = "/SuspendSIM"
 ENDPOINT_UNSUSPEND_SIM = "/UnsuspendSIM"

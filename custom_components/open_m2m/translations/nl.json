@@ -35,6 +35,12 @@
       "subscriptions_aggregate_remaining": {
         "name": "Resterende data (totaal)"
       },
+      "usage_total_current_month": {
+        "name": "Verbruik (deze maand)"
+      },
+      "usage_total_previous_month": {
+        "name": "Verbruik (vorige maand)"
+      },
       "sim_subscription_status": {
         "name": "Abonnementsstatus"
       },

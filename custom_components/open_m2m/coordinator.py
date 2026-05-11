@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, NotRequired, TypedDict
 
 from homeassistant.config_entries import ConfigEntry
@@ -11,7 +12,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import OpenM2MClient, OpenM2MError
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, MAX_DATABUNDLES
+from .const import (
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    MAX_DATABUNDLES,
+    MAX_PRODUCT_INFO_FETCHES,
+    MAX_SIM_DETAIL_ENRICHMENT_PER_REFRESH,
+    MAX_USAGE_TOTALS_SUBSCRIPTION_TRIES,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,6 +27,14 @@ _LOGGER = logging.getLogger(__name__)
 SUBSCRIPTION_FETCH_CONCURRENCY = 3
 # Cap optional ``GetSubscriptionInfo`` calls per refresh to avoid slowdowns.
 MAX_SUBSCRIPTION_INFO_CALLS = 10
+
+
+class UsageTotalsMonth(TypedDict):
+    """Normalized ``GetUsageTotals`` / ``CDR`` slice for one calendar month."""
+
+    year: int
+    month: int
+    total_usage_kb: float
 
 
 class OpenM2MCoordinatorData(TypedDict):
@@ -30,6 +46,8 @@ class OpenM2MCoordinatorData(TypedDict):
     subscriptions: list[dict[str, Any]]
     subscriptions_aggregate_remaining_bytes: int | None
     databundles: list[dict[str, Any]]
+    usage_totals_current: UsageTotalsMonth | None
+    usage_totals_previous: UsageTotalsMonth | None
     account_balance_raw: NotRequired[Any]
 
 
@@ -114,11 +132,35 @@ def _extract_balance(account: dict[str, Any]) -> tuple[float | None, Any]:
     return (None, None)
 
 
+def _sim_row_nonempty_description(row: dict[str, Any]) -> bool:
+    """True when the portal exposes any non-empty SIM label / description field."""
+    for key in ("description", "Description", "sim_description", "SimDescription"):
+        v = row.get(key)
+        if isinstance(v, str) and v.strip():
+            return True
+    return False
+
+
+def _inject_iccid_from_sim_mapping(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """When ``SIMs`` is ``{ id: { ... } }`` and rows omit ``ICCID``, copy digit keys."""
+    out: list[dict[str, Any]] = []
+    for k, v in mapping.items():
+        if not isinstance(v, dict):
+            continue
+        row = dict(v)
+        if not _normalize_iccid(row.get("ICCID") or row.get("iccid")):
+            ks = str(k).strip().upper().replace(" ", "")
+            if ks.isdigit() and 18 <= len(ks) <= 22:
+                row["ICCID"] = ks
+        out.append(row)
+    return out
+
+
 def _normalize_sims(sims_payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Turn ``GetSIMs`` JSON into a list of SIM dicts.
 
-    The published OpenAPI models ``SIMs`` as an object; live responses may use
-    a list or a single SIM-shaped dict. Parse defensively and log surprises.
+    ``SIMs`` may be a **list**, a **single SIM object** (keys such as ``ICCID``),
+    or a **map** of id → row. Parse defensively and log odd shapes at debug.
     """
     raw = sims_payload.get("SIMs")
     if raw is None:
@@ -135,18 +177,39 @@ def _normalize_sims(sims_payload: dict[str, Any]) -> list[dict[str, Any]]:
         return [x for x in raw if isinstance(x, dict)]
 
     if isinstance(raw, dict):
+        # One SIM row: ICCID / subscription_id, or portal SIM name + MSISDN/IMSI (no ICCID key).
         if any(k in raw for k in ("ICCID", "iccid", "subscription_id")):
+            return [raw]
+        if any(k in raw for k in ("description", "Description", "sim_description", "SimDescription")) and any(
+            k in raw for k in ("MSISDN", "msisdn", "IMSI", "imsi")
+        ):
             return [raw]
         values = [v for v in raw.values() if isinstance(v, dict)]
         if values:
+            missing_all_iccid = all(
+                _normalize_iccid(v.get("ICCID") or v.get("iccid")) is None
+                for v in values
+            )
+            if missing_all_iccid:
+                injected = _inject_iccid_from_sim_mapping(raw)
+                if injected:
+                    _LOGGER.debug(
+                        "GetSIMs: flattened SIMs id→row map (%s row(s)); ICCID from keys where missing",
+                        len(injected),
+                    )
+                    return injected
+                _LOGGER.debug(
+                    "GetSIMs: SIMs dict values lack ICCID and keys are not usable as ICCID; keys=%s",
+                    list(raw.keys())[:20],
+                )
             return values
-        _LOGGER.warning(
-            "GetSIMs returned SIMs object without recognizable SIM entries; keys=%s",
+        _LOGGER.debug(
+            "GetSIMs returned SIMs object without recognizable SIM dict rows; keys=%s",
             list(raw.keys())[:20],
         )
         return []
 
-    _LOGGER.warning(
+    _LOGGER.debug(
         "Unexpected SIMs payload type %s; ignoring", type(raw).__name__
     )
     return []
@@ -226,7 +289,17 @@ _SUBSCRIPTION_ROW_MARKERS: tuple[str, ...] = (
     "product_description",
     "ProductDescription",
     "sim_description",
+    "SimDescription",
+    "IMSI",
+    "imsi",
+    "volumegroup",
+    "databundle_id",
 )
+
+
+def _looks_like_subscription_dict(d: dict[str, Any]) -> bool:
+    """True if ``d`` resembles one ``GetSubscriptions`` row (object vs id→row map)."""
+    return any(m in d for m in _SUBSCRIPTION_ROW_MARKERS)
 
 
 def _subscription_payload_bases(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -276,7 +349,7 @@ def _normalize_subscription_container(base: dict[str, Any]) -> list[dict[str, An
         return [r for r in rows if r.get("subscription_id") not in (None, "")]
 
     if isinstance(raw, dict):
-        if any(m in raw for m in _SUBSCRIPTION_ROW_MARKERS):
+        if _looks_like_subscription_dict(raw):
             row = dict(raw)
             _ensure_subscription_id(row)
             return [row] if row.get("subscription_id") not in (None, "") else []
@@ -331,12 +404,26 @@ def _ensure_subscription_ids(rows: list[dict[str, Any]]) -> None:
 
 
 def _normalize_subscription_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Collect subscription rows from top-level and common wrapper dicts."""
+    """Collect subscription rows from top-level and common wrapper dicts.
+
+    Merges rows from every payload level (e.g. top-level ``Subscriptions`` and
+    ``data.Subscriptions``). Deduplicates by ``subscription_id`` so the same
+    subscription is not counted twice when the API echoes list and object shapes.
+    """
+    seen_ids: set[str] = set()
+    merged: list[dict[str, Any]] = []
     for base in _subscription_payload_bases(payload):
-        rows = _normalize_subscription_container(base)
-        if rows:
-            return rows
-    return []
+        for row in _normalize_subscription_container(base):
+            _ensure_subscription_id(row)
+            sid = row.get("subscription_id")
+            if sid is None or str(sid).strip() == "":
+                continue
+            key = str(sid).strip()
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            merged.append(row)
+    return merged
 
 
 def _mb_pair_to_bytes(used_mb: float | None, volume_mb: float | None) -> tuple[int | None, int | None]:
@@ -700,9 +787,92 @@ def _parse_imei_lock_field(val: Any) -> str | bool | None:
     return None
 
 
+_SUBSCRIPTION_INFO_KEYS: tuple[str, ...] = (
+    "SubscriptionInfo",
+    "subscription_info",
+    "subscriptionInfo",
+)
+
+
+def _subscription_info_payload_bases(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Unwrap ``GetSubscriptionInfo`` JSON so ``SubscriptionInfo`` may sit under ``data``/``result``."""
+    bases: list[dict[str, Any]] = [payload]
+    for w in _SUBSCRIPTION_PAYLOAD_WRAPPERS:
+        inner = payload.get(w)
+        if isinstance(inner, dict):
+            bases.append(inner)
+    return bases
+
+
+def _subscription_info_value_as_dict(val: Any) -> dict[str, Any] | None:
+    """Treat ``SubscriptionInfo`` as a dict, or the first dict element if the API uses a list."""
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, list):
+        for item in val:
+            if isinstance(item, dict):
+                return item
+    return None
+
+
+def _dict_has_subscription_info_row_signals(d: dict[str, Any]) -> bool:
+    """True when this dict carries detail fields typical of ``GetSubscriptionInfo`` (not only status)."""
+    for k in (
+        "SIMinfo",
+        "sim_info",
+        "simInfo",
+        "Productinfo",
+        "ProductInfo",
+        "productinfo",
+        "product_info",
+        "subscription_id",
+        "SubscriptionID",
+        "subscriptionId",
+        "UpgradeOptions",
+        "upgrade_options",
+        "upgradeOptions",
+        "limit_data",
+        "LimitData",
+        "monthly",
+        "Monthly",
+        "imeilock",
+        "imei_lock",
+        "IMEILock",
+    ):
+        if k in d:
+            return True
+    return False
+
+
+def _dict_is_only_api_success_shallow(d: dict[str, Any]) -> bool:
+    """True when the dict has no merge-relevant keys besides API status/code (and empty wrappers)."""
+    for k in d:
+        ks = str(k)
+        if ks in ("APIstatus", "APIcode", "status", "message", "Message"):
+            continue
+        if k in _SUBSCRIPTION_PAYLOAD_WRAPPERS:
+            continue
+        return False
+    return True
+
+
 def _subscription_info_dict(info_payload: dict[str, Any]) -> dict[str, Any] | None:
-    for key in ("SubscriptionInfo", "subscription_info", "subscriptionInfo"):
-        v = info_payload.get(key)
+    """Resolve the inner object for ``GetSubscriptionInfo`` (wrapped, list, or flat body)."""
+    for base in _subscription_info_payload_bases(info_payload):
+        for key in _SUBSCRIPTION_INFO_KEYS:
+            inner = _subscription_info_value_as_dict(base.get(key))
+            if inner is not None:
+                return inner
+        if _dict_has_subscription_info_row_signals(base) and not _dict_is_only_api_success_shallow(
+            base
+        ):
+            return base
+    return None
+
+
+def _upgrade_options_dict(parent: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("UpgradeOptions", "upgrade_options", "upgradeOptions"):
+        v = parent.get(key)
         if isinstance(v, dict):
             return v
     return None
@@ -713,7 +883,93 @@ def _product_info_dict(parent: dict[str, Any]) -> dict[str, Any] | None:
         v = parent.get(key)
         if isinstance(v, dict):
             return v
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    return item
     return None
+
+
+def _parse_intish(val: Any) -> int | None:
+    """Parse a whole number for ids (reject bool; allow int-like float)."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        if val.is_integer():
+            try:
+                return int(val)
+            except (ValueError, OverflowError):
+                return None
+        return None
+    if isinstance(val, str):
+        s = val.strip()
+        if s.isdigit() or (s.startswith("-") and len(s) > 1 and s[1:].isdigit()):
+            try:
+                return int(s)
+            except ValueError:
+                return None
+    return None
+
+
+def _subscription_row_product_id(row: dict[str, Any]) -> int | None:
+    """Portal product id from a raw ``GetSubscriptions``-shaped row or nested ``Productinfo``."""
+    for key in ("product_id", "ProductID", "productId", "ProductId"):
+        pid = _parse_intish(row.get(key))
+        if pid is not None:
+            return pid
+    prod = _product_info_dict(row)
+    if isinstance(prod, dict):
+        for ik in ("id", "ID", "product_id", "ProductID"):
+            pid = _parse_intish(prod.get(ik))
+            if pid is not None:
+                return pid
+    return None
+
+
+def _product_info_from_get_product_info_payload(
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Product row from ``GetProductInfo`` success body."""
+    for key in ("ProductInfo", "Productinfo", "product_info", "productInfo"):
+        v = payload.get(key)
+        if isinstance(v, dict):
+            return v
+    return None
+
+
+def _merge_product_info_detail_into_subscription(
+    base: dict[str, Any], detail: dict[str, Any]
+) -> None:
+    """Set ``product_info_detail`` and fill name/description/data only when missing.
+
+    EUR amounts live only under ``product_info_detail`` so ``monthly`` (bool plan
+    cadence from ``GetSubscriptionInfo``) is never conflated with product ``monthly`` price.
+    """
+    base["product_info_detail"] = dict(detail)
+
+    if not base.get("product_name"):
+        name = detail.get("name")
+        if isinstance(name, str) and name.strip():
+            base["product_name"] = name.strip()
+
+    if not base.get("product_description"):
+        for k in ("description", "long_description", "Description"):
+            v = detail.get(k)
+            if isinstance(v, str) and v.strip():
+                base["product_description"] = v.strip()
+                break
+
+    if base.get("product_data_included_mb") is None:
+        di = detail.get("data_included") or detail.get("DataIncluded")
+        if isinstance(di, (int, float)):
+            f_di = float(di)
+            base["product_data_included_mb"] = f_di
+            _, p_inc_b = _mb_pair_to_bytes(None, f_di)
+            base["product_data_included_bytes"] = p_inc_b
+            if base.get("data_allowance_bytes") is None:
+                base["data_allowance_bytes"] = p_inc_b
 
 
 def _sim_info_dict(parent: dict[str, Any]) -> dict[str, Any] | None:
@@ -721,6 +977,10 @@ def _sim_info_dict(parent: dict[str, Any]) -> dict[str, Any] | None:
         v = parent.get(key)
         if isinstance(v, dict):
             return v
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    return item
     return None
 
 
@@ -853,6 +1113,10 @@ def _merge_subscription_info(
         base["limit_data_mb"] = lim
 
     prod = _product_info_dict(raw)
+    if prod is None:
+        uo = _upgrade_options_dict(raw)
+        if isinstance(uo, dict):
+            prod = _product_info_dict(uo)
     if isinstance(prod, dict):
         if not base.get("product_name"):
             desc = prod.get("description") or prod.get("product_description")
@@ -870,6 +1134,15 @@ def _merge_subscription_info(
             base["product_data_included_bytes"] = p_inc_b
             if base.get("data_allowance_bytes") is None:
                 base["data_allowance_bytes"] = p_inc_b
+        if base.get("product_id") is None:
+            pvid = _parse_intish(
+                prod.get("id")
+                or prod.get("ID")
+                or prod.get("product_id")
+                or prod.get("ProductID")
+            )
+            if pvid is not None:
+                base["product_id"] = pvid
 
     siminfo = _sim_info_dict(raw)
     if isinstance(siminfo, dict):
@@ -884,11 +1157,232 @@ def _merge_subscription_info(
                 base["msisdn"] = ms
         sdesc = (
             siminfo.get("description")
+            or siminfo.get("Description")
             or siminfo.get("sim_description")
             or siminfo.get("SimDescription")
         )
         if isinstance(sdesc, str) and sdesc.strip() and not base.get("sim_description"):
             base["sim_description"] = sdesc.strip()
+
+
+_SIM_CREDENTIAL_KEYS_LOWER: frozenset[str] = frozenset(
+    {
+        "pin",
+        "puk",
+        "pin1",
+        "puk1",
+        "pin2",
+        "puk2",
+        "simpin",
+        "simpuk",
+    }
+)
+
+
+def _strip_sensitive_sim_fields_for_merge(d: dict[str, Any]) -> dict[str, Any]:
+    """Drop PIN/PUK-style keys before merging SIM detail into coordinator rows."""
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(k, str):
+            lk = k.strip().lower()
+            if lk in _SIM_CREDENTIAL_KEYS_LOWER:
+                continue
+        out[k] = v
+    return out
+
+
+def _is_empty_for_sim_merge(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    if isinstance(v, (list, dict)) and len(v) == 0:
+        return True
+    return False
+
+
+def _base_value_nonempty_for_sim_merge(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str) and v.strip():
+        return True
+    if isinstance(v, (list, dict)) and len(v) > 0:
+        return True
+    if isinstance(v, (int, float, bool)):
+        return True
+    return False
+
+
+def _merge_sim_detail_into_row(base: dict[str, Any], detail_row: dict[str, Any]) -> None:
+    """Merge ``GetSIM`` ``SIM`` object into a list row; never overwrite non-empty with empty."""
+    cleaned = _strip_sensitive_sim_fields_for_merge(detail_row)
+    for k, v in cleaned.items():
+        if _is_empty_for_sim_merge(v) and _base_value_nonempty_for_sim_merge(base.get(k)):
+            continue
+        base[k] = v
+
+
+def _sim_object_from_get_sim_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("SIM", "sim", "Sim"):
+        block = payload.get(key)
+        if isinstance(block, dict):
+            return block
+    return None
+
+
+async def _enrich_sims_with_get_sim(
+    client: OpenM2MClient,
+    sims: list[dict[str, Any]],
+    *,
+    max_calls: int,
+) -> None:
+    """Call ``GetSIM`` for rows with ICCID but no description (capped per refresh)."""
+    if max_calls <= 0:
+        return
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for row in sims:
+        if not isinstance(row, dict):
+            continue
+        ic = _normalize_iccid(row.get("ICCID") or row.get("iccid"))
+        if not ic:
+            continue
+        if _sim_row_nonempty_description(row):
+            continue
+        candidates.append((ic, row))
+    if not candidates:
+        return
+    for ic, row in candidates[:max_calls]:
+        try:
+            payload = await client.async_get_sim(ic)
+        except OpenM2MError as err:
+            _LOGGER.debug("GetSIM(%s) failed: %s", ic, err)
+            continue
+        detail = _sim_object_from_get_sim_payload(payload)
+        if not isinstance(detail, dict):
+            _LOGGER.debug(
+                "GetSIM(%s) success but no SIM object; keys=%s",
+                ic,
+                sorted(str(k) for k in payload.keys())[:25],
+            )
+            continue
+        _merge_sim_detail_into_row(row, detail)
+
+
+def _cdr_row_total_usage_kb(row: dict[str, Any]) -> float | None:
+    """Parse one CDR row's usage in kilobytes (portal key variants)."""
+    for key in (
+        "total_usage_kb",
+        "TotalUsageKb",
+        "total_usage_KB",
+        "usage_kb",
+        "UsageKb",
+        "used_kb",
+        "UsedKb",
+        "Total_usage_kb",
+    ):
+        v = row.get(key)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip().replace(",", ".")
+            if s:
+                try:
+                    return float(s)
+                except ValueError:
+                    continue
+    return None
+
+
+def _cdr_rows_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """``CDR`` may be one object or a list of CDR-shaped dicts."""
+    raw = payload.get("CDR") or payload.get("cdr")
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    return []
+
+
+def _usage_totals_from_get_usage_payload(
+    payload: dict[str, Any],
+    *,
+    expect_year: int,
+    expect_month: int,
+) -> UsageTotalsMonth | None:
+    """Sum ``total_usage_kb`` across CDR rows; ``year``/``month`` follow the requested period."""
+    rows = _cdr_rows_from_payload(payload)
+    if not rows:
+        return None
+    total = 0.0
+    seen = False
+    for row in rows:
+        kb = _cdr_row_total_usage_kb(row)
+        if kb is not None:
+            total += kb
+            seen = True
+    if not seen:
+        return None
+    return {
+        "year": expect_year,
+        "month": expect_month,
+        "total_usage_kb": total,
+    }
+
+
+async def _async_fetch_usage_totals_month(
+    client: OpenM2MClient,
+    year: int,
+    month: int,
+    subscription_ids: list[str],
+) -> UsageTotalsMonth | None:
+    """Account-level ``GetUsageTotals`` first; then up to ``MAX_USAGE_TOTALS_SUBSCRIPTION_TRIES`` ids."""
+    try:
+        payload = await client.async_get_usage_totals(year=year, month=month)
+        parsed = _usage_totals_from_get_usage_payload(
+            payload, expect_year=year, expect_month=month
+        )
+        if parsed is not None:
+            return parsed
+    except OpenM2MError as err:
+        _LOGGER.debug(
+            "GetUsageTotals(%s-%02d) account-scoped failed: %s", year, month, err
+        )
+
+    total_kb = 0.0
+    any_part = False
+    for sid in subscription_ids[:MAX_USAGE_TOTALS_SUBSCRIPTION_TRIES]:
+        try:
+            sid_i = int(str(sid).strip())
+        except (TypeError, ValueError):
+            continue
+        try:
+            payload = await client.async_get_usage_totals(
+                year=year, month=month, subscription_id=sid_i
+            )
+        except OpenM2MError as err:
+            _LOGGER.debug(
+                "GetUsageTotals(%s-%02d, subscription_id=%s) failed: %s",
+                year,
+                month,
+                sid,
+                err,
+            )
+            continue
+        part = _usage_totals_from_get_usage_payload(
+            payload, expect_year=year, expect_month=month
+        )
+        if part is not None:
+            total_kb += float(part["total_usage_kb"])
+            any_part = True
+    if any_part:
+        return {
+            "year": year,
+            "month": month,
+            "total_usage_kb": total_kb,
+        }
+    return None
 
 
 async def _gather_limited(
@@ -938,6 +1432,11 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
 
         balance, balance_raw = _extract_balance(account)
         sims = _normalize_sims(sims_raw)
+        await _enrich_sims_with_get_sim(
+            self.client,
+            sims,
+            max_calls=MAX_SIM_DETAIL_ENRICHMENT_PER_REFRESH,
+        )
         sim_iccids = _sim_iccid_set(sims)
 
         subscriptions: list[dict[str, Any]] = []
@@ -1129,6 +1628,9 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
                 norm["dataproduct_data_included_bytes"] = dpb
             else:
                 norm["dataproduct_data_included_bytes"] = None
+            row_pid = _subscription_row_product_id(row)
+            if row_pid is not None:
+                norm["product_id"] = row_pid
             return norm
 
         enriched = await _gather_limited(
@@ -1193,6 +1695,44 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
                 continue
             _merge_subscription_info(by_id[sid], payload)
 
+        # Optional ``GetProductInfo``: up to ``MAX_PRODUCT_INFO_FETCHES`` unique
+        # ``product_id`` values (after list + subscription-info merge).
+        pid_order: list[int] = []
+        seen_pid: set[int] = set()
+        for sub in sorted(subscriptions, key=lambda s: str(s.get("subscription_id", ""))):
+            pid = _parse_intish(sub.get("product_id"))
+            if pid is None or pid in seen_pid:
+                continue
+            seen_pid.add(pid)
+            pid_order.append(pid)
+        pid_order = pid_order[:MAX_PRODUCT_INFO_FETCHES]
+
+        async def fetch_product(pid: int) -> tuple[int, dict[str, Any] | None]:
+            try:
+                payload = await self.client.async_get_product_info(pid)
+            except OpenM2MError as err:
+                _LOGGER.debug("GetProductInfo(%s) failed: %s", pid, err)
+                return pid, None
+            return pid, payload
+
+        product_results = await _gather_limited(
+            [fetch_product(p) for p in pid_order],
+            limit=SUBSCRIPTION_FETCH_CONCURRENCY,
+        )
+        detail_by_pid: dict[int, dict[str, Any]] = {}
+        for pid, payload in product_results:
+            if not isinstance(payload, dict):
+                continue
+            detail = _product_info_from_get_product_info_payload(payload)
+            if isinstance(detail, dict):
+                detail_by_pid[pid] = detail
+
+        for sub in subscriptions:
+            pid = _parse_intish(sub.get("product_id"))
+            if pid is None or pid not in detail_by_pid:
+                continue
+            _merge_product_info_detail_into_subscription(sub, detail_by_pid[pid])
+
         for sub in subscriptions:
             ic = sub.get("iccid")
             if isinstance(ic, str) and ic:
@@ -1220,6 +1760,26 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
             max_rows=MAX_DATABUNDLES,
         )
 
+        now_utc = datetime.now(timezone.utc)
+        cur_y, cur_m = now_utc.year, now_utc.month
+        if cur_m == 1:
+            prev_y, prev_m = cur_y - 1, 12
+        else:
+            prev_y, prev_m = cur_y, cur_m - 1
+
+        sub_ids_for_usage = [
+            str(s["subscription_id"])
+            for s in subscriptions
+            if isinstance(s, dict) and s.get("subscription_id")
+        ]
+
+        usage_current = await _async_fetch_usage_totals_month(
+            self.client, cur_y, cur_m, sub_ids_for_usage
+        )
+        usage_previous = await _async_fetch_usage_totals_month(
+            self.client, prev_y, prev_m, sub_ids_for_usage
+        )
+
         data: OpenM2MCoordinatorData = {
             "account": account,
             "account_balance": balance,
@@ -1227,6 +1787,8 @@ class OpenM2MCoordinator(DataUpdateCoordinator[OpenM2MCoordinatorData]):
             "subscriptions": subscriptions,
             "subscriptions_aggregate_remaining_bytes": aggregate_remaining,
             "databundles": databundles,
+            "usage_totals_current": usage_current,
+            "usage_totals_previous": usage_previous,
         }
         if balance_raw is not None:
             data["account_balance_raw"] = balance_raw

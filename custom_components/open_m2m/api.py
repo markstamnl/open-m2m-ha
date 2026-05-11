@@ -18,10 +18,13 @@ from .const import (
     ENDPOINT_GET_DATABUNDLES,
     ENDPOINT_GET_SUBSCRIPTION_INFO,
     ENDPOINT_GET_SUBSCRIPTIONS,
+    ENDPOINT_PRODUCT_INFO,
     ENDPOINT_GET_VOLUME_GROUPS,
+    ENDPOINT_GET_SIM,
     ENDPOINT_SIMS,
     ENDPOINT_SUSPEND_SIM,
     ENDPOINT_UNSUSPEND_SIM,
+    ENDPOINT_USAGE_TOTALS,
 )
 
 CONTENT_TYPE_FORM: Final[str] = "application/x-www-form-urlencoded"
@@ -109,6 +112,10 @@ class OpenM2MClient:
         """Call ``GetSIMs`` (list / map of SIMs for the account)."""
         return await self._post_json(ENDPOINT_SIMS)
 
+    async def async_get_sim(self, iccid: str) -> dict[str, Any]:
+        """Call ``GetSIM`` for one SIM (same ``ICCID`` form field as ``SuspendSIM``)."""
+        return await self._post_json(ENDPOINT_GET_SIM, {"ICCID": iccid})
+
     async def async_get_subscriptions(self) -> dict[str, Any]:
         """Call ``GetSubscriptions``."""
         return await self._post_json(ENDPOINT_GET_SUBSCRIPTIONS)
@@ -120,6 +127,13 @@ class OpenM2MClient:
         return await self._post_json(
             ENDPOINT_GET_SUBSCRIPTION_INFO,
             {"subscription_id": str(subscription_id)},
+        )
+
+    async def async_get_product_info(self, product_id: int) -> dict[str, Any]:
+        """Call ``GetProductInfo`` for one product id (portal ``ProductInfo.id``)."""
+        return await self._post_json(
+            ENDPOINT_PRODUCT_INFO,
+            {"product_id": str(int(product_id))},
         )
 
     async def async_get_databundles(self, subscription_id: str | int) -> dict[str, Any]:
@@ -137,6 +151,25 @@ class OpenM2MClient:
         if subscription_id is not None:
             extra = {"subscription_id": str(subscription_id)}
         return await self._post_json(ENDPOINT_GET_VOLUME_GROUPS, extra)
+
+    async def async_get_usage_totals(
+        self,
+        *,
+        year: int,
+        month: int,
+        subscription_id: int | None = None,
+        iccid: str | None = None,
+    ) -> dict[str, Any]:
+        """Call ``GetUsageTotals`` (calendar month; optional ``subscription_id`` / ``ICCID``)."""
+        extra: dict[str, Any] = {
+            "year": str(int(year)),
+            "month": str(int(month)),
+        }
+        if subscription_id is not None:
+            extra["subscription_id"] = str(int(subscription_id))
+        if iccid is not None and str(iccid).strip():
+            extra["ICCID"] = str(iccid).strip()
+        return await self._post_json(ENDPOINT_USAGE_TOTALS, extra)
 
     async def async_suspend_sim(self, iccid: str) -> dict[str, Any]:
         """Call ``SuspendSIM``."""

@@ -21,7 +21,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OpenM2MCoordinator, OpenM2MCoordinatorData
+from .coordinator import (
+    OpenM2MCoordinator,
+    OpenM2MCoordinatorData,
+    UsageTotalsMonth,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,16 +63,179 @@ def _id_tail_for_display(raw: str, *, max_digits: int = 8) -> str:
     return alnum or raw
 
 
+# Portal SIM label from GetSIMs / subscription merge (never PIN/PUK field names).
+_SIM_PORTAL_DISPLAY_NAME_KEYS: tuple[str, ...] = (
+    "description",
+    "Description",
+    "sim_description",
+    "SimDescription",
+)
+
+
+def _sim_portal_display_name_fragment(row: dict[str, Any]) -> str | None:
+    """Trimmed portal SIM name / description; None if absent or blank."""
+    for key in _SIM_PORTAL_DISPLAY_NAME_KEYS:
+        v = row.get(key)
+        if isinstance(v, str) and (s := v.strip()):
+            return s
+    return None
+
+
+def _truncate_ha_device_name(name: str, *, max_len: int = 200) -> str:
+    if len(name) <= max_len:
+        return name
+    return name[: max_len - 1].rstrip() + "…"
+
+
 def _open_m2m_sim_device_title(iccid: str) -> str:
     """Short hub-facing SIM device title: Open-M2M + tail of ICCID / sub id."""
     return f"Open-M2M {_id_tail_for_display(iccid)}"
 
 
-def _subscription_device_title(sub: dict[str, Any]) -> str:
-    """Short subscription device name; matches SIM title when ICCID aligns."""
+def _sim_device_display_name(
+    iccid: str,
+    sim: dict[str, Any],
+    *,
+    subscription: dict[str, Any] | None = None,
+) -> str:
+    """Device name: portal SIM description when present (via_device links to account); else ICCID tail."""
+    for src in (sim, subscription or {}):
+        frag = _sim_portal_display_name_fragment(src)
+        if frag:
+            return _truncate_ha_device_name(frag)
+    return _open_m2m_sim_device_title(iccid)
+
+
+def _sim_iccid(sim: dict[str, Any]) -> str | None:
+    for key in ("ICCID", "iccid"):
+        v = sim.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip().upper()
+    sid = sim.get("subscription_id")
+    if sid is not None:
+        return f"sub_{sid}"
+    return None
+
+
+def _sim_row_for_iccid(
+    coordinator: OpenM2MCoordinator, iccid: str
+) -> dict[str, Any] | None:
+    """Matching GetSIMs row for a normalized ICCID (uppercase)."""
+    data = coordinator.data
+    if not data:
+        return None
+    ic_up = iccid.strip().upper()
+    for row in data.get("sims", []):
+        if not isinstance(row, dict):
+            continue
+        sic = _sim_iccid(row)
+        if isinstance(sic, str) and sic.strip().upper() == ic_up:
+            return row
+    return None
+
+
+def _subscription_hint_for_iccid(
+    coordinator: OpenM2MCoordinator, iccid: str
+) -> dict[str, Any] | None:
+    """First merged subscription row for this ICCID (for SIM name when GetSIMs omits description)."""
+    data = coordinator.data
+    if not data:
+        return None
+    ic_up = iccid.strip().upper()
+    merged_first: dict[str, Any] | None = None
+    for row in data.get("subscriptions", []) or []:
+        if not isinstance(row, dict):
+            continue
+        raw_ic = row.get("iccid")
+        if not isinstance(raw_ic, str) or raw_ic.strip().upper() != ic_up:
+            continue
+        if row.get("merged_onto_sim"):
+            return row
+        if merged_first is None:
+            merged_first = row
+    return merged_first
+
+
+def _product_info_detail_extra_attributes(sub: dict[str, Any]) -> dict[str, Any]:
+    """Flatten ``GetProductInfo`` / ``product_info_detail`` for entity attributes."""
+    out: dict[str, Any] = {}
+    pid = sub.get("product_id")
+    if pid is not None:
+        out["product_id"] = pid
+    detail = sub.get("product_info_detail")
+    if not isinstance(detail, dict):
+        return out
+    out["product_info_detail"] = dict(detail)
+
+    def add_money(api_key: str, attr_key: str) -> None:
+        v = detail.get(api_key)
+        if isinstance(v, bool):
+            return
+        if isinstance(v, (int, float)):
+            out[attr_key] = float(v)
+            return
+        if isinstance(v, str):
+            s = v.strip().replace(",", ".")
+            if not s:
+                return
+            try:
+                out[attr_key] = float(s)
+            except ValueError:
+                return
+
+    add_money("monthly", "product_price_monthly_eur")
+    add_money("onetime", "product_price_onetime_eur")
+    add_money("prorate_price", "product_price_prorate_eur")
+    add_money("nextmonth_price", "product_price_nextmonth_eur")
+    add_money("price", "product_price_total_eur")
+
+    for k in (
+        "prorate_fromdate",
+        "prorate_todate",
+        "nextmonth_fromdate",
+        "nextmonth_todate",
+        "fromdate",
+        "todate",
+    ):
+        v = detail.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+
+    name = detail.get("name")
+    if isinstance(name, str) and name.strip():
+        out["product_catalog_name"] = name.strip()
+
+    return out
+
+
+def _subscription_row_by_id(
+    coordinator: OpenM2MCoordinator, subscription_id: Any
+) -> dict[str, Any] | None:
+    sid = str(subscription_id).strip() if subscription_id is not None else ""
+    if not sid:
+        return None
+    data = coordinator.data
+    if not data:
+        return None
+    for row in data.get("subscriptions", []) or []:
+        if isinstance(row, dict) and str(row.get("subscription_id")) == sid:
+            return row
+    return None
+
+
+def _subscription_device_title(
+    sub: dict[str, Any], coordinator: OpenM2MCoordinator | None
+) -> str:
+    """Subscription device name; matches SIM device naming when ICCID aligns."""
     iccid_raw = sub.get("iccid")
     if isinstance(iccid_raw, str) and iccid_raw.strip():
-        return _open_m2m_sim_device_title(iccid_raw.strip().upper())
+        ic = iccid_raw.strip().upper()
+        sim: dict[str, Any] = {}
+        if coordinator is not None:
+            found = _sim_row_for_iccid(coordinator, ic)
+            if found is not None:
+                sim = found
+        return _sim_device_display_name(ic, sim, subscription=sub)
     sid = sub.get("subscription_id")
     if sid is not None and str(sid).strip():
         return f"Sub {sid}"
@@ -118,6 +285,8 @@ def _sim_device_info(
     entry: ConfigEntry,
     iccid: str,
     sim: dict[str, Any],
+    *,
+    subscription: dict[str, Any] | None = None,
 ) -> DeviceInfo:
     """Shared SIM ``DeviceInfo`` for SIM sensors and merged databundles."""
     product = _product_info(sim)
@@ -128,22 +297,11 @@ def _sim_device_info(
     )
     return DeviceInfo(
         identifiers={(DOMAIN, iccid)},
-        name=_open_m2m_sim_device_title(iccid),
+        name=_sim_device_display_name(iccid, sim, subscription=subscription),
         manufacturer="Open-M2M",
         model=model or "SIM",
         via_device=(DOMAIN, entry.entry_id),
     )
-
-
-def _sim_iccid(sim: dict[str, Any]) -> str | None:
-    for key in ("ICCID", "iccid"):
-        v = sim.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip().upper()
-    sid = sim.get("subscription_id")
-    if sid is not None:
-        return f"sub_{sid}"
-    return None
 
 
 def _sim_usage_kb(sim: dict[str, Any]) -> float | None:
@@ -273,20 +431,13 @@ def _databundle_device_info(
     iccid = iccid_raw.strip() if isinstance(iccid_raw, str) else None
     merged = bool(row.get("merged_onto_sim"))
     if merged and iccid:
-        sim_row: dict[str, Any] | None = None
-        data = coordinator.data
-        if data:
-            ic_up = iccid.strip().upper()
-            for s in data.get("sims", []):
-                if not isinstance(s, dict):
-                    continue
-                sic = _sim_iccid(s)
-                if isinstance(sic, str) and sic.strip().upper() == ic_up:
-                    sim_row = s
-                    break
+        sim_row = _sim_row_for_iccid(coordinator, iccid)
         sim = sim_row or {}
+        sub_hint = _subscription_row_by_id(coordinator, row.get("linked_subscription_id"))
+        if sub_hint is None:
+            sub_hint = _subscription_hint_for_iccid(coordinator, iccid)
         # Use row ICCID string as identifier (same as pre-refactor merged databundles).
-        return _sim_device_info(entry, iccid, sim)
+        return _sim_device_info(entry, iccid, sim, subscription=sub_hint)
 
     ident = row.get("device_identifier")
     if not isinstance(ident, str) or not ident:
@@ -486,6 +637,120 @@ class OpenM2MSubscriptionCountSensor(OpenM2MBaseSensor):
         return len(data.get("subscriptions", []))
 
 
+def _usage_totals_to_bytes(usage: UsageTotalsMonth | None) -> int | None:
+    """Portal reports kilobytes; ``SensorDeviceClass.DATA_SIZE`` expects bytes."""
+    if usage is None:
+        return None
+    kb = usage.get("total_usage_kb")
+    if not isinstance(kb, (int, float)):
+        return None
+    return int(round(float(kb) * 1024))
+
+
+class OpenM2MAccountUsageTotalCurrentMonthSensor(OpenM2MBaseSensor):
+    """Account-level ``GetUsageTotals`` for the current UTC calendar month (bytes)."""
+
+    def __init__(
+        self,
+        coordinator: OpenM2MCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_usage_total_current_month"
+        self.entity_description = SensorEntityDescription(
+            key="usage_total_current_month",
+            translation_key="usage_total_current_month",
+            device_class=SensorDeviceClass.DATA_SIZE,
+            native_unit_of_measurement=UnitOfInformation.BYTES,
+            state_class=SensorStateClass.MEASUREMENT,
+            suggested_display_precision=0,
+        )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name=_ACCOUNT_HUB_DEVICE_NAME,
+            manufacturer="Open-M2M",
+            model="Account",
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        data = self.coordinator.data
+        if not data:
+            return None
+        return _usage_totals_to_bytes(data.get("usage_totals_current"))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        if not data:
+            return {}
+        u = data.get("usage_totals_current")
+        if not isinstance(u, dict):
+            return {}
+        y, m = u.get("year"), u.get("month")
+        attrs: dict[str, Any] = {}
+        if isinstance(y, int):
+            attrs["year"] = y
+        if isinstance(m, int):
+            attrs["month"] = m
+        return attrs
+
+
+class OpenM2MAccountUsageTotalPreviousMonthSensor(OpenM2MBaseSensor):
+    """Same as current-month sensor for the previous UTC calendar month."""
+
+    def __init__(
+        self,
+        coordinator: OpenM2MCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_usage_total_previous_month"
+        self.entity_description = SensorEntityDescription(
+            key="usage_total_previous_month",
+            translation_key="usage_total_previous_month",
+            device_class=SensorDeviceClass.DATA_SIZE,
+            native_unit_of_measurement=UnitOfInformation.BYTES,
+            state_class=SensorStateClass.TOTAL,
+            suggested_display_precision=0,
+        )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name=_ACCOUNT_HUB_DEVICE_NAME,
+            manufacturer="Open-M2M",
+            model="Account",
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        data = self.coordinator.data
+        if not data:
+            return None
+        return _usage_totals_to_bytes(data.get("usage_totals_previous"))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        if not data:
+            return {}
+        u = data.get("usage_totals_previous")
+        if not isinstance(u, dict):
+            return {}
+        y, m = u.get("year"), u.get("month")
+        attrs: dict[str, Any] = {}
+        if isinstance(y, int):
+            attrs["year"] = y
+        if isinstance(m, int):
+            attrs["month"] = m
+        return attrs
+
+
 class OpenM2MSubscriptionsAggregateRemainingSensor(OpenM2MBaseSensor):
     """Sum of (allowance − used) across subscriptions when both are known (bytes)."""
 
@@ -553,7 +818,8 @@ class OpenM2MSimSensorBase(OpenM2MBaseSensor):
     @property
     def device_info(self) -> DeviceInfo:
         sim = self._current_sim() or self._sim_static
-        return _sim_device_info(self._entry, self._iccid, sim)
+        hint = _subscription_hint_for_iccid(self.coordinator, self._iccid)
+        return _sim_device_info(self._entry, self._iccid, sim, subscription=hint)
 
 
 class OpenM2MSimSubscriptionSensor(OpenM2MSimSensorBase):
@@ -694,7 +960,7 @@ class OpenM2MSubscriptionSensorBase(OpenM2MBaseSensor):
             ident = f"sub_{self._subscription_id}"
         return DeviceInfo(
             identifiers={(DOMAIN, ident)},
-            name=_subscription_device_title(sub),
+            name=_subscription_device_title(sub, self.coordinator),
             manufacturer="Open-M2M",
             model="Subscription",
             via_device=(DOMAIN, self._entry.entry_id),
@@ -761,6 +1027,7 @@ class OpenM2MSubscriptionPortalStatusSensor(OpenM2MSubscriptionSensorBase):
         dps = sub.get("dataproduct_summaries")
         if isinstance(dps, list) and dps:
             attrs["dataproduct_summaries"] = dps
+        attrs.update(_product_info_detail_extra_attributes(sub))
         return attrs
 
 
@@ -1107,6 +1374,11 @@ class OpenM2MSubscriptionProductDescriptionSensor(OpenM2MSubscriptionSensorBase)
             if isinstance(v, str) and v.strip():
                 return v.strip()
         return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        sub = self._current_sub() or self._sub_static
+        return _product_info_detail_extra_attributes(sub)
 
 
 class OpenM2MSubscriptionMonthlySensor(OpenM2MSubscriptionSensorBase):
