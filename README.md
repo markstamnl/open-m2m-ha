@@ -17,6 +17,8 @@ Home Assistant custom integration for the [Open-M2M](https://portal.open-m2m.com
 
 Behavior and API notes: [`custom_components/open_m2m/README.md`](custom_components/open_m2m/README.md). Brand assets: `custom_components/open_m2m/brand/` (HA **2026.3+**).
 
+**HACS “icon not available”:** Core can show local `brand/` icons on **2026.3+**, but HACS dialogs often still hit the [public brands CDN](https://github.com/home-assistant/brands); until HACS prefers the local brands proxy (see [hacs/integration#5171](https://github.com/hacs/integration/issues/5171)), a [home-assistant/brands](https://github.com/home-assistant/brands) PR is the reliable fix for that UI.
+
 ## Configuration
 
 **Settings** → **Devices & services** → **Add integration** → **Open-M2M** (domain `open_m2m`) — API key in the config flow. Cloud polling hub (`iot_class` in `manifest.json`).
@@ -30,7 +32,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-Replace `X.Y.Z` with the semver you are shipping (aligned with `version` in `manifest.json`). The latest release tag is shown on GitHub under **Releases** (not duplicated here to avoid drift). The [Release workflow](.github/workflows/release.yml) runs on `v*` tag pushes and publishes a GitHub Release (auto-generated release notes from merged PRs and commits).
+Replace `X.Y.Z` with the semver you are shipping (aligned with `version` in `manifest.json`). The latest release tag is shown on GitHub under **Releases** (not duplicated here to avoid drift). The [Release workflow](.github/workflows/release.yml) runs on `v*` tag pushes and publishes a GitHub Release: the release body is the matching `## [X.Y.Z]` block from [`CHANGELOG.md`](CHANGELOG.md) when present; otherwise GitHub’s auto-generated notes are used (HACS shows that body in the update popup).
 
 ## Features
 
