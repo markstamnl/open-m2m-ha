@@ -17,6 +17,9 @@ API_FIELD_APIKEY = "apikey"
 DEFAULT_TIMEOUT = 10  # seconds
 DEFAULT_SCAN_INTERVAL = timedelta(minutes=15)
 
+# Cap normalized databundle rows per coordinator refresh to limit sensor fan-out.
+MAX_DATABUNDLES = 20
+
 # Endpoint paths (relative to ``BASE_URL``). Names match OpenAPI v1.0.7 (SwaggerHub).
 ENDPOINT_TEST_API = "/TestAPI"
 ENDPOINT_ACCOUNT_INFO = "/GetAccountInfo"
