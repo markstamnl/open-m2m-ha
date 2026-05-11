@@ -15,7 +15,7 @@ Home Assistant custom integration for the [Open-M2M](https://portal.open-m2m.com
 
 **Manual:** Copy `custom_components/open_m2m/` next to `configuration.yaml` and restart.
 
-Source and behavior details: [`custom_components/open_m2m/`](custom_components/open_m2m/). Brand images live under `custom_components/open_m2m/brand/` (served on Home Assistant **2026.3+**). Dutch translations via `translations/nl.json`.
+Behavior and API notes: [`custom_components/open_m2m/README.md`](custom_components/open_m2m/README.md). Brand assets: `custom_components/open_m2m/brand/` (HA **2026.3+**).
 
 ## Configuration
 
@@ -33,12 +33,6 @@ Adjust the version as needed. The [Release workflow](.github/workflows/release.y
 
 ## Features
 
-- **Account** — balance and account-oriented sensors.
-- **SIMs** — per-SIM devices (ICCID), status/usage/plan when the API provides them; SIM count at account level.
-- **Subscriptions** — per-subscription devices/sensors (status, data used/allowance, bundles, renewals, timestamps; attributes where available).
-- **Databundles** — linked bundle sensors (capped per refresh; see integration README).
-- **Services** — `open_m2m.suspend_sim` / `open_m2m.unsuspend_sim` ([`services.yaml`](custom_components/open_m2m/services.yaml)).
+Account balance and counts; per-SIM and per-subscription devices with status, usage, plans, and databundles (capped per refresh); **Usage (this month / last month)** from `GetUsageTotals`; services `open_m2m.suspend_sim` / `open_m2m.unsuspend_sim` ([`services.yaml`](custom_components/open_m2m/services.yaml)). Entity list and API mapping: [`custom_components/open_m2m/README.md`](custom_components/open_m2m/README.md).
 
-Entity list, API mapping, and assumptions: [`custom_components/open_m2m/README.md`](custom_components/open_m2m/README.md).
-
-**Docs · issues · releases:** [github.com/markstamnl/open-m2m-ha](https://github.com/markstamnl/open-m2m-ha) · [Issues](https://github.com/markstamnl/open-m2m-ha/issues) · tag `vX.Y.Z` and match `version` in `custom_components/open_m2m/manifest.json` (no `v` prefix).
+**Repo:** [github.com/markstamnl/open-m2m-ha](https://github.com/markstamnl/open-m2m-ha) · [Issues](https://github.com/markstamnl/open-m2m-ha/issues) — tag `vX.Y.Z` matches `version` in `custom_components/open_m2m/manifest.json` (no `v` prefix).
